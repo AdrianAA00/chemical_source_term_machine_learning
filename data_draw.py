@@ -2,8 +2,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # Load the training data
-file_path_1 = '/Users/xiaoxizhou/Downloads/adrian_surf/code/pinn_predictions.csv'
-file_path_2 = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data.csv'
+file_path_1 = '/Users/xiaoxizhou/Downloads/adrian_surf/code/sindy_predictions.csv'
+file_path_2 = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data_random_ICs/training_data_all_ICs.csv'
 df1 = pd.read_csv(file_path_1)
 df2 = pd.read_csv(file_path_2)
 

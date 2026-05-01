@@ -44,7 +44,7 @@ import argparse
 CFG = dict(
     # --- files ---
     yaml_path   = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data/airNASA9ions.yaml',
-    csv_path    = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data/training_data.csv',
+    csv_path    = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data_random_ICs/training_data_all_ICs.csv',
     checkpoint  = 'sindy_autoencoder.pth',
 
     # --- species tracked in data_generation.py (must match CSV columns) ---
@@ -127,7 +127,14 @@ def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac:
     Returns:
       loaders : (train_loader, val_loader, test_loader)
       stats   : dict with X_mean, X_std, Y_mean, Y_std  (float32 np arrays)
-      raw     : dict with X_raw, Y_raw (un-normalised, for physics residuals)
+      raw     : dict with X_raw, Y_raw, ic_index  (un-normalised)
+
+    Multi-IC aware: if the CSV has an `IC_index` column (as produced by
+    data_generation_more.py with 10 random initial conditions), then
+      - finite-difference time derivatives are computed PER trajectory
+        (so we never differentiate across an IC boundary), and
+      - train / val / test are split BY trajectory (whole ICs go together),
+        which gives a real test of generalisation to unseen initial states.
     """
     df = pd.read_csv(csv_path)
 
@@ -148,21 +155,54 @@ def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac:
     X_norm = (X_raw - X_mean) / (X_std + 1e-8)
     Y_norm = (Y_raw - Y_mean) / (Y_std + 1e-8)
 
-    # ── Time derivative of x: dlog10(X)/d(log10 t)  (finite difference) ──────
-    # Used for the SINDy ẋ loss term — in normalised log10 space
-    dYdt_norm = np.gradient(Y_norm, X_norm.squeeze(), axis=0).astype(np.float32)
+    # ── Detect multi-IC dataset ──────────────────────────────────────────────
+    has_ic = 'IC_index' in df.columns
+    if has_ic:
+        ic_arr = df['IC_index'].values.astype(np.int64)
+        ic_list = sorted(np.unique(ic_arr).tolist())
+        print(f"Multi-IC dataset detected: {len(ic_list)} trajectories")
+    else:
+        ic_arr = np.zeros(len(df), dtype=np.int64)
+        ic_list = [0]
 
-    # ── Split by trajectory position (not random) — avoids data leakage ───────
-    N = len(X_norm)
-    n_test = int(N * test_frac)
-    n_val  = int(N * val_frac)
-    n_train = N - n_val - n_test
+    # ── Time derivative of x: per-trajectory finite difference ───────────────
+    # Used for the SINDy ẋ loss term — in normalised log10 space.
+    # CRUCIAL: gradient must NOT cross IC boundaries.
+    dYdt_norm = np.zeros_like(Y_norm)
+    for ic in ic_list:
+        m = (ic_arr == ic)
+        ic_X = X_norm[m].squeeze(-1)
+        ic_Y = Y_norm[m]
+        # np.gradient needs at least 2 points along axis
+        if ic_Y.shape[0] >= 2:
+            dYdt_norm[m] = np.gradient(ic_Y, ic_X, axis=0)
+    dYdt_norm = dYdt_norm.astype(np.float32)
 
-    # Take train from middle, val from early, test from late
-    idx = np.arange(N)
-    idx_train = idx[:n_train]
-    idx_val   = idx[n_train:n_train + n_val]
-    idx_test  = idx[n_train + n_val:]
+    # ── Split BY trajectory when we have multiple ICs  ───────────────────────
+    if has_ic and len(ic_list) >= 4:
+        rng = np.random.default_rng(42)
+        perm = rng.permutation(ic_list)
+        n_test_ic = max(1, int(round(len(ic_list) * test_frac)))
+        n_val_ic  = max(1, int(round(len(ic_list) * val_frac)))
+        test_ics  = set(perm[:n_test_ic].tolist())
+        val_ics   = set(perm[n_test_ic:n_test_ic + n_val_ic].tolist())
+        train_ics = set(perm[n_test_ic + n_val_ic:].tolist())
+
+        idx_train = np.where(np.isin(ic_arr, list(train_ics)))[0]
+        idx_val   = np.where(np.isin(ic_arr, list(val_ics)))[0]
+        idx_test  = np.where(np.isin(ic_arr, list(test_ics)))[0]
+        print(f"  train ICs = {sorted(train_ics)}")
+        print(f"  val   ICs = {sorted(val_ics)}")
+        print(f"  test  ICs = {sorted(test_ics)}")
+    else:
+        N = len(X_norm)
+        n_test = int(N * test_frac)
+        n_val  = int(N * val_frac)
+        n_train = N - n_val - n_test
+        idx = np.arange(N)
+        idx_train = idx[:n_train]
+        idx_val   = idx[n_train:n_train + n_val]
+        idx_test  = idx[n_train + n_val:]
 
     def make_loader(idx, shuffle):
         ds = TensorDataset(
@@ -179,9 +219,10 @@ def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac:
         make_loader(idx_test,  shuffle=False),
     )
     stats = dict(X_mean=X_mean, X_std=X_std, Y_mean=Y_mean, Y_std=Y_std)
-    raw   = dict(X_raw=X_raw, Y_raw=Y_raw)
+    raw   = dict(X_raw=X_raw, Y_raw=Y_raw, ic_index=ic_arr)
 
-    print(f"Dataset: {N} total  |  train {n_train}  val {n_val}  test {n_test}")
+    print(f"Dataset: {len(X_norm)} total  |  train {len(idx_train)}  "
+          f"val {len(idx_val)}  test {len(idx_test)}")
     print(f"Inputs : {X_norm.shape}   Outputs: {Y_norm.shape}")
     return loaders, stats, raw
 
@@ -782,10 +823,14 @@ def plot_reconstruction(
     species: list,
     device: str = 'cpu',
     save_path: str = 'sindy_reconstruction.png',
+    plot_ics: list = None,
 ):
-    """Plot ground truth vs SINDy-Autoencoder reconstruction."""
+    """Plot ground truth vs SINDy-Autoencoder reconstruction.
+
+    For multi-IC data (CSV has IC_index column) we plot one figure per IC
+    in `plot_ics` (default: first 3 ICs) so the time axis stays meaningful.
+    """
     df = pd.read_csv(csv_path)
-    n_species = len(species)
 
     # Build normalised Y (same as training)
     log10_sp = np.stack([df[f'log10_X_{s}'].values for s in species], axis=1)
@@ -801,30 +846,46 @@ def plot_reconstruction(
         z, Y_hat_norm = model(Y_t)
         Y_hat_norm = Y_hat_norm.cpu().numpy()
 
-    # De-normalise
     Y_hat_log10 = Y_hat_norm * (stats['Y_std'] + 1e-8) + stats['Y_mean']
     Y_hat_orig  = 10.0 ** Y_hat_log10
     Y_orig      = 10.0 ** Y_raw
 
-    time = df['time'].values
+    has_ic = 'IC_index' in df.columns
+    if has_ic and plot_ics is None:
+        plot_ics = sorted(df['IC_index'].unique().tolist())[:3]
+    elif not has_ic:
+        plot_ics = [None]   # single trajectory mode
 
-    fig, axes = plt.subplots(3, 3, figsize=(15, 10))
-    axes = axes.flatten()
     plot_species = species[:8] + ['T']
     orig_cols    = [f'X_{s}' for s in species] + ['T', 'P']
 
-    for idx, (sp, ax) in enumerate(zip(plot_species, axes)):
-        col_idx = orig_cols.index(f'X_{sp}') if sp in species else orig_cols.index('T')
-        ax.semilogx(time, Y_orig[:, col_idx],      'k-',  lw=2, label='Cantera (truth)')
-        ax.semilogx(time, Y_hat_orig[:, col_idx],  'r--', lw=1.5, label='SINDy-AE')
-        ax.set_title(sp); ax.set_xlabel('Time (s)')
-        ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+    for ic in plot_ics:
+        if ic is None:
+            mask = np.ones(len(df), dtype=bool)
+            tag, suptitle = '', 'SINDy-Autoencoder Reconstruction vs Cantera'
+        else:
+            mask = (df['IC_index'].values == ic)
+            tag = f'_IC{int(ic):02d}'
+            suptitle = f'SINDy-AE Reconstruction vs Cantera — IC {int(ic)}'
 
-    plt.suptitle('SINDy-Autoencoder Reconstruction vs Cantera', fontsize=13)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    print(f"Saved reconstruction plot → {save_path}")
-    plt.show()
+        time = df['time'].values[mask]
+        Y_o, Y_h = Y_orig[mask], Y_hat_orig[mask]
+
+        fig, axes = plt.subplots(3, 3, figsize=(15, 10))
+        axes = axes.flatten()
+        for sp, ax in zip(plot_species, axes):
+            col_idx = orig_cols.index(f'X_{sp}') if sp in species else orig_cols.index('T')
+            ax.semilogx(time, Y_o[:, col_idx], 'k-',  lw=2,   label='Cantera (truth)')
+            ax.semilogx(time, Y_h[:, col_idx], 'r--', lw=1.5, label='SINDy-AE')
+            ax.set_title(sp); ax.set_xlabel('Time (s)')
+            ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+        plt.suptitle(suptitle, fontsize=13)
+        plt.tight_layout()
+        out = save_path.replace('.png', f'{tag}.png')
+        plt.savefig(out, dpi=150)
+        print(f"Saved reconstruction plot → {out}")
+        plt.close(fig)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -917,6 +978,11 @@ def save_predictions_csv(
     data['T_K']       = T_pred
     data['P_Pa']      = P_pred
     data['rho_kgm3']  = np.full(len(time), np.nan)    # not predicted by AE
+
+    # Preserve IC_index + IC0_<species> columns if present in the source CSV
+    for col in df_ref.columns:
+        if col == 'IC_index' or col.startswith('IC0_'):
+            data[col] = df_ref[col].values
 
     df_out = pd.DataFrame(data)
 
