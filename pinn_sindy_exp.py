@@ -30,7 +30,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.func import jvp
 import matplotlib.pyplot as plt
 import argparse
 
@@ -40,8 +40,8 @@ import argparse
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = dict(
     # --- files ---
-    yaml_path   = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data/airNASA9ions.yaml',
-    csv_path    = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data_random_ICs/training_data_all_ICs.csv',
+    yaml_path   = './airNASA9ions.yaml',
+    csv_path    = './training_data_all_ICs.csv',
     checkpoint  = 'sindy_autoencoder_exp.pth',
 
     # --- species tracked in data_generation.py (must match CSV columns) ---
@@ -77,7 +77,7 @@ CFG = dict(
 
     # --- training ---
     epochs      = 2000,
-    batch_size  = 512,
+    batch_size  = 16384,
     lr          = 3e-4,
     val_frac    = 0.15,
     test_frac   = 0.15,
@@ -88,7 +88,25 @@ CFG = dict(
     sindy_threshold = 0.05,
 )
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+def _select_device():
+    """Pick the best available accelerator: CUDA > Apple MPS > CPU."""
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True          # fixed shapes → autotune
+        torch.set_float32_matmul_precision('high')     # TF32 matmul on Ampere/Ada
+        print(f"Device: cuda ({torch.cuda.get_device_name(0)}, "
+              f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB) "
+              f"— torch {torch.__version__}")
+        return 'cuda'
+    if getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+        # Apple Silicon GPU (Metal Performance Shaders).
+        # All training tensors must be float32 — MPS has limited float64 support.
+        print(f"Device: mps (Apple Silicon GPU) — torch {torch.__version__}")
+        return 'mps'
+    print(f"Device: cpu — torch {torch.__version__}")
+    return 'cpu'
+
+
+DEVICE = _select_device()
 torch.manual_seed(42)
 np.random.seed(42)
 
@@ -129,6 +147,31 @@ def build_stoichiometry_matrix(yaml_path: str, species_tracked: list) -> torch.T
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  DATA LOADING  (mirrors data_generation.py + data_machine_learning.py)
 # ─────────────────────────────────────────────────────────────────────────────
+class TensorBatcher:
+    """
+    Drop-in replacement for DataLoader when the whole dataset fits in VRAM.
+    Holds GPU-resident tensors and yields batches by index slicing — no host
+    transfers, no worker processes, no pin-memory bookkeeping.
+    """
+    def __init__(self, tensors, batch_size: int, shuffle: bool):
+        self.tensors    = tensors
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
+        self.N          = tensors[0].shape[0]
+        self.device     = tensors[0].device
+
+    def __iter__(self):
+        idx = (torch.randperm(self.N, device=self.device)
+               if self.shuffle else
+               torch.arange(self.N, device=self.device))
+        for s in range(0, self.N, self.batch_size):
+            sl = idx[s:s + self.batch_size]
+            yield tuple(t.index_select(0, sl) for t in self.tensors)
+
+    def __len__(self):
+        return (self.N + self.batch_size - 1) // self.batch_size
+
+
 def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac: float,
                        use_ln_state: bool = True):
     """
@@ -215,13 +258,15 @@ def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac:
         idx_train, idx_val, idx_test = idx[:n_train], idx[n_train:n_train+n_val], idx[n_train+n_val:]
 
     def make_loader(idx, shuffle):
-        ds = TensorDataset(
-            torch.tensor(X_norm[idx]),
-            torch.tensor(Y_norm[idx]),
-            torch.tensor(dYdt_norm[idx]),
-            torch.tensor(Y_raw[idx]),
+        # All tensors live on the GPU for the whole run — no per-batch H2D copy,
+        # no DataLoader workers. Suitable when the dataset fits in VRAM.
+        tensors = (
+            torch.as_tensor(X_norm[idx]).to(DEVICE),
+            torch.as_tensor(Y_norm[idx]).to(DEVICE),
+            torch.as_tensor(dYdt_norm[idx]).to(DEVICE),
+            torch.as_tensor(Y_raw[idx]).to(DEVICE),
         )
-        return DataLoader(ds, batch_size=CFG['batch_size'], shuffle=shuffle, pin_memory=True)
+        return TensorBatcher(tensors, CFG['batch_size'], shuffle=shuffle)
 
     loaders = (
         make_loader(idx_train, shuffle=True),
@@ -451,33 +496,11 @@ def sindy_loss_xdot(
     """
     λ₁ term: ‖ẋ - (∇_z ψ(z)) Θ(z^T) Ξ ‖²
 
-    (∇_z ψ(z)) is the Jacobian of the decoder w.r.t. z.
-    Θ(z) Ξ  is the predicted ż from SINDy.
-    Chain rule: ẋ_predicted = J_ψ @ ż_sindy
+    Forward-mode JVP: ẋ_pred = J_ψ(z) @ ż_sindy in a single pass — no full
+    Jacobian materialised, no per-output backward loop.
     """
-    z_var = z.detach().requires_grad_(True)
-
-    # Recompute decoder with grad-enabled z
-    xh = model.decode(z_var)                            # [batch, n_x]
-    n_x = xh.shape[1]
-
-    # Jacobian of decoder: J_ψ ∈ [batch, n_x, latent_dim]
-    # Compute row by row (memory efficient for moderate n_x)
-    J_rows = []
-    for k in range(n_x):
-        grad_k = torch.autograd.grad(
-            xh[:, k].sum(), z_var,
-            retain_graph=True, create_graph=True
-        )[0]                                            # [batch, latent_dim]
-        J_rows.append(grad_k.unsqueeze(1))
-    J_psi = torch.cat(J_rows, dim=1)                   # [batch, n_x, latent_dim]
-
-    # ż from SINDy: [batch, latent_dim, 1]
-    zdot_sindy = model.sindy_predict_zdot(z).unsqueeze(-1)
-
-    # Predicted ẋ: J_ψ @ ż  → [batch, n_x]
-    xdot_pred = (J_psi @ zdot_sindy).squeeze(-1)
-
+    zdot_sindy = model.sindy_predict_zdot(z)
+    _, xdot_pred = jvp(model.decode, (z,), (zdot_sindy,))
     return F.mse_loss(xdot_pred, xdot)
 
 
@@ -490,31 +513,10 @@ def sindy_loss_zdot(
     """
     λ₂ term: ‖(∇_x z) ẋ - Θ(z^T) Ξ ‖²
 
-    (∇_x z) is the Jacobian of the encoder w.r.t. x.
-    ż_data  = J_φ @ ẋ   (chain rule from data)
-    ż_sindy = Θ(z) Ξ    (SINDy prediction)
+    Forward-mode JVP: ż_data = J_φ(x) @ ẋ in one pass.
     """
-    x_var = x.detach().requires_grad_(True)
-    z_var = model.encode(x_var)                         # [batch, latent_dim]
-
-    latent_dim = z_var.shape[1]
-
-    # Jacobian of encoder: J_φ ∈ [batch, latent_dim, n_x]
-    J_rows = []
-    for k in range(latent_dim):
-        grad_k = torch.autograd.grad(
-            z_var[:, k].sum(), x_var,
-            retain_graph=True, create_graph=True
-        )[0]                                            # [batch, n_x]
-        J_rows.append(grad_k.unsqueeze(1))
-    J_phi = torch.cat(J_rows, dim=1)                   # [batch, latent_dim, n_x]
-
-    # ż from data: J_φ @ ẋ  → [batch, latent_dim]
-    zdot_data  = (J_phi @ xdot.unsqueeze(-1)).squeeze(-1)
-
-    # ż from SINDy
+    _, zdot_data = jvp(model.encode, (x,), (xdot,))
     zdot_sindy = model.sindy_predict_zdot(z)
-
     return F.mse_loss(zdot_sindy, zdot_data)
 
 
@@ -659,15 +661,13 @@ def train(cfg: dict = CFG):
 
         # — Train —
         model.train()
-        running = {k: 0.0 for k in ['total','recon','xdot','zdot','sparse']}
+        # Accumulate as GPU tensors — only sync (.item()) once at epoch end.
+        running = {k: torch.zeros((), device=DEVICE)
+                   for k in ['total','recon','xdot','zdot','sparse']}
         n_train = 0
 
-        for x_b, y_b, dxdt_b, y_raw_b in train_loader:
-            x_b     = y_b.to(DEVICE)         # x = normalised output state
-            xdot_b  = dxdt_b.to(DEVICE)
-            xraw_b  = y_raw_b.to(DEVICE)
-
-            optimizer.zero_grad()
+        for _, x_b, xdot_b, xraw_b in train_loader:   # tensors are already on GPU
+            optimizer.zero_grad(set_to_none=True)
             losses = compute_loss(
                 model, x_b, xdot_b, xraw_b, A, n_species, cfg, compute_sindy
             )
@@ -675,29 +675,24 @@ def train(cfg: dict = CFG):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            bs = len(x_b)
+            bs = x_b.shape[0]
             for k in running:
-                running[k] += losses[k].item() * bs
+                running[k] += losses[k].detach() * bs
             n_train += bs
 
         scheduler.step()
 
-        for k in running:
-            running[k] /= n_train
+        running = {k: (v / n_train).item() for k, v in running.items()}
 
         # — Validate —
         model.eval()
-        val_total = 0.0; n_val = 0
+        val_total = torch.zeros((), device=DEVICE); n_val = 0
         with torch.no_grad():
-            for x_b, y_b, dxdt_b, y_raw_b in val_loader:
-                x_b    = y_b.to(DEVICE)
-                xdot_b = dxdt_b.to(DEVICE)
-                xraw_b = y_raw_b.to(DEVICE)
-                # skip Jacobian losses for validation (too slow every epoch)
+            for _, x_b, _, _ in val_loader:
                 z, xh = model(x_b)
-                val_total += F.mse_loss(xh, x_b).item() * len(x_b)
-                n_val     += len(x_b)
-        val_total /= n_val
+                val_total += F.mse_loss(xh, x_b, reduction='sum') / x_b.shape[1]
+                n_val     += x_b.shape[0]
+        val_total = (val_total / n_val).item()
 
         # History
         history['train_total'].append(running['total'])
@@ -734,14 +729,13 @@ def train(cfg: dict = CFG):
 
     # ── Test set evaluation ───────────────────────────────────────────────────
     model.eval()
-    test_mse = 0.0; n_test = 0
+    test_mse = torch.zeros((), device=DEVICE); n_test = 0
     with torch.no_grad():
-        for x_b, y_b, dxdt_b, y_raw_b in test_loader:
-            x_b = y_b.to(DEVICE)
+        for _, x_b, _, _ in test_loader:
             z, xh = model(x_b)
-            test_mse += F.mse_loss(xh, x_b).item() * len(x_b)
-            n_test   += len(x_b)
-    print(f"Test MSE (reconstruction, normalised log10 space): {test_mse/n_test:.6f}")
+            test_mse += F.mse_loss(xh, x_b, reduction='sum') / x_b.shape[1]
+            n_test   += x_b.shape[0]
+    print(f"Test MSE (reconstruction, normalised log10 space): {(test_mse / n_test).item():.6f}")
 
     # ── Print discovered Ξ  ───────────────────────────────────────────────────
     print_sindy_coefficients(model, cfg['latent_dim'], cfg['sindy_poly_degree'],
@@ -796,7 +790,7 @@ def predict_batch(
     x = (log10_t.reshape(-1, 1).astype(np.float32) - X_mean) / (X_std + 1e-8)
 
     # The autoencoder takes the OUTPUT state as x (not log10_t directly)
-    # For inference, we pass a dummy y_norm — better approach: 
+    # For inference, we pass a dummy y_norm — better approach:
     # use the encoder to map from the output space after getting a seed
     # Here we generate predictions by interpolating the latent trajectory.
     # Simple approach: encode the normalised output from a reference, then decode.
