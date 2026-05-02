@@ -40,9 +40,9 @@ import argparse
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = dict(
     # --- files ---
-    yaml_path   = '/Users/xiaoxizhou/Downloads/adrian_surf/code/airNASA9ions.yaml',
-    csv_path    = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data.csv',
-    checkpoint  = 'sindy_autoencoder.pth',
+    yaml_path   = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data/airNASA9ions.yaml',
+    csv_path    = '/Users/xiaoxizhou/Downloads/adrian_surf/code/training_data_random_ICs/training_data_all_ICs.csv',
+    checkpoint  = 'sindy_autoencoder_exp.pth',
 
     # --- species tracked in data_generation.py (must match CSV columns) ---
     species     = ['CO2', 'O2', 'N2', 'CO', 'NO', 'C', 'O', 'N'],
@@ -52,8 +52,19 @@ CFG = dict(
     enc_hidden  = [64, 64, 32],
     dec_hidden  = [32, 64, 64],
 
-    # --- SINDy library: poly degree 2 in z (no cross terms to keep Ξ sparse) ---
+    # --- SINDy library type ---
+    #   'poly'  : 1, z_i, z_i*z_j           (Champion 2019, fails on Arrhenius)
+    #   'exp'   : 1, z_i, exp(±z_i)         (mass-action in log space)
+    #   'mixed' : poly ∪ exp                (recommended for chemistry)
+    sindy_lib_type    = 'mixed',
     sindy_poly_degree = 2,
+
+    # --- state representation: natural log of (mole fractions, T, P) ---
+    # log10 columns from the CSV are simply scaled by ln(10) so the network
+    # operates on u = ln(state). After normalisation this is equivalent to
+    # working in log10 space, but it makes the SINDy library definitions
+    # (exp / Arrhenius) interpretable in physical units.
+    use_ln_state      = True,
 
     # --- loss weights (λ₁, λ₂, λ₃ from the PNAS paper image) ---
     lambda1     = 1e-3,   # SINDy loss in ẋ
@@ -118,54 +129,97 @@ def build_stoichiometry_matrix(yaml_path: str, species_tracked: list) -> torch.T
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  DATA LOADING  (mirrors data_generation.py + data_machine_learning.py)
 # ─────────────────────────────────────────────────────────────────────────────
-def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac: float):
+def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac: float,
+                       use_ln_state: bool = True):
     """
-    Returns:
+    Multi-IC aware data pipeline in (natural-)log space.
+
+    State u = ln(state) = (ln X_1, ..., ln X_n, ln T, ln P)
+    Time  τ = ln(t)
+
+    Why ln (not log10): mass-action chemistry says
+        d X_i/dt = Σ_r ν_{i,r} k_r ∏ X_j^{a_j}
+        k_r      = A_r T^{n_r} exp(-E_{a,r}/(R T))
+    Take ln of any rate term:
+        ln(rate) = ln(A) + n·ln T - E_a/R · 1/T + Σ a_j · ln X_j
+                 = affine in (ln X_j, ln T, 1/T)
+    so any chemistry rate is a *sum of exponentials of affine functions* of
+    the log-state. That is exactly what the exp library Θ(z) below can match.
+
+    Returns
       loaders : (train_loader, val_loader, test_loader)
       stats   : dict with X_mean, X_std, Y_mean, Y_std  (float32 np arrays)
-      raw     : dict with X_raw, Y_raw (un-normalised, for physics residuals)
+      raw     : dict with X_raw, Y_raw, ic_index
     """
     df = pd.read_csv(csv_path)
+    LN10 = np.log(10.0).astype(np.float32) if False else float(np.log(10.0))
 
-    # ── Input: log10(t)  ──────────────────────────────────────────────────────
-    X_raw = df[['log10_t']].values.astype(np.float32)          # [N, 1]
+    # ── Input: ln(t) (or log10 t — equivalent up to scale after normalisation)
+    if use_ln_state:
+        X_raw = (df[['log10_t']].values * LN10).astype(np.float32)   # [N, 1]
+    else:
+        X_raw = df[['log10_t']].values.astype(np.float32)
 
-    # ── Output: log10(Xi) + log10(T) + log10(P)  ─────────────────────────────
-    log10_sp_cols = [f'log10_X_{s}' for s in species]
-    Y_log_sp = df[log10_sp_cols].values.astype(np.float32)      # [N, n_sp]
-    Y_log_T  = np.log10(df['T_K'].values).reshape(-1,1).astype(np.float32)
-    Y_log_P  = np.log10(df['P_Pa'].values).reshape(-1,1).astype(np.float32)
-    Y_raw    = np.hstack([Y_log_sp, Y_log_T, Y_log_P])          # [N, n_sp+2]
+    # ── Output: u = ln(species), ln(T), ln(P) ────────────────────────────────
+    log10_sp = df[[f'log10_X_{s}' for s in species]].values.astype(np.float32)
+    log10_T  = np.log10(df['T_K'].values).reshape(-1, 1).astype(np.float32)
+    log10_P  = np.log10(df['P_Pa'].values).reshape(-1, 1).astype(np.float32)
+    Y_log10  = np.hstack([log10_sp, log10_T, log10_P])              # [N, n_sp+2]
+    Y_raw    = (Y_log10 * LN10) if use_ln_state else Y_log10
 
-    # ── Normalisation stats (computed on full dataset before split) ───────────
+    # ── Normalisation stats ──────────────────────────────────────────────────
     X_mean = X_raw.mean(axis=0); X_std = X_raw.std(axis=0)
     Y_mean = Y_raw.mean(axis=0); Y_std = Y_raw.std(axis=0)
 
     X_norm = (X_raw - X_mean) / (X_std + 1e-8)
     Y_norm = (Y_raw - Y_mean) / (Y_std + 1e-8)
 
-    # ── Time derivative of x: dlog10(X)/d(log10 t)  (finite difference) ──────
-    # Used for the SINDy ẋ loss term — in normalised log10 space
-    dYdt_norm = np.gradient(Y_norm, X_norm.squeeze(), axis=0).astype(np.float32)
+    # ── Multi-IC detection ───────────────────────────────────────────────────
+    has_ic = 'IC_index' in df.columns
+    if has_ic:
+        ic_arr  = df['IC_index'].values.astype(np.int64)
+        ic_list = sorted(np.unique(ic_arr).tolist())
+        print(f"Multi-IC dataset: {len(ic_list)} trajectories")
+    else:
+        ic_arr  = np.zeros(len(df), dtype=np.int64)
+        ic_list = [0]
 
-    # ── Split by trajectory position (not random) — avoids data leakage ───────
-    N = len(X_norm)
-    n_test = int(N * test_frac)
-    n_val  = int(N * val_frac)
-    n_train = N - n_val - n_test
+    # ── Per-IC finite difference  d u / d τ  ─────────────────────────────────
+    dYdt_norm = np.zeros_like(Y_norm)
+    for ic in ic_list:
+        m = (ic_arr == ic)
+        ic_X = X_norm[m].squeeze(-1)
+        ic_Y = Y_norm[m]
+        if ic_Y.shape[0] >= 2:
+            dYdt_norm[m] = np.gradient(ic_Y, ic_X, axis=0)
+    dYdt_norm = dYdt_norm.astype(np.float32)
 
-    # Take train from middle, val from early, test from late
-    idx = np.arange(N)
-    idx_train = idx[:n_train]
-    idx_val   = idx[n_train:n_train + n_val]
-    idx_test  = idx[n_train + n_val:]
+    # ── Split BY trajectory when multi-IC, else by position  ─────────────────
+    if has_ic and len(ic_list) >= 4:
+        rng       = np.random.default_rng(42)
+        perm      = rng.permutation(ic_list)
+        n_test_ic = max(1, int(round(len(ic_list) * test_frac)))
+        n_val_ic  = max(1, int(round(len(ic_list) * val_frac)))
+        test_ics  = set(perm[:n_test_ic].tolist())
+        val_ics   = set(perm[n_test_ic:n_test_ic + n_val_ic].tolist())
+        train_ics = set(perm[n_test_ic + n_val_ic:].tolist())
+        idx_train = np.where(np.isin(ic_arr, list(train_ics)))[0]
+        idx_val   = np.where(np.isin(ic_arr, list(val_ics)))[0]
+        idx_test  = np.where(np.isin(ic_arr, list(test_ics)))[0]
+        print(f"  train ICs={sorted(train_ics)}  val ICs={sorted(val_ics)}  test ICs={sorted(test_ics)}")
+    else:
+        N = len(X_norm)
+        n_test = int(N * test_frac); n_val = int(N * val_frac)
+        n_train = N - n_val - n_test
+        idx = np.arange(N)
+        idx_train, idx_val, idx_test = idx[:n_train], idx[n_train:n_train+n_val], idx[n_train+n_val:]
 
     def make_loader(idx, shuffle):
         ds = TensorDataset(
             torch.tensor(X_norm[idx]),
             torch.tensor(Y_norm[idx]),
             torch.tensor(dYdt_norm[idx]),
-            torch.tensor(Y_raw[idx]),   # raw log10 values for physics
+            torch.tensor(Y_raw[idx]),
         )
         return DataLoader(ds, batch_size=CFG['batch_size'], shuffle=shuffle, pin_memory=True)
 
@@ -174,10 +228,13 @@ def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac:
         make_loader(idx_val,   shuffle=False),
         make_loader(idx_test,  shuffle=False),
     )
-    stats = dict(X_mean=X_mean, X_std=X_std, Y_mean=Y_mean, Y_std=Y_std)
-    raw   = dict(X_raw=X_raw, Y_raw=Y_raw)
+    stats = dict(X_mean=X_mean, X_std=X_std, Y_mean=Y_mean, Y_std=Y_std,
+                 use_ln_state=use_ln_state)
+    raw   = dict(X_raw=X_raw, Y_raw=Y_raw, ic_index=ic_arr)
 
-    print(f"Dataset: {N} total  |  train {n_train}  val {n_val}  test {n_test}")
+    print(f"State space: {'ln(state)' if use_ln_state else 'log10(state)'}  "
+          f"(equivalent up to scale after normalisation)")
+    print(f"Dataset: {len(X_norm)}  |  train {len(idx_train)}  val {len(idx_val)}  test {len(idx_test)}")
     print(f"Inputs : {X_norm.shape}   Outputs: {Y_norm.shape}")
     return loaders, stats, raw
 
@@ -185,36 +242,72 @@ def load_and_normalize(csv_path: str, species: list, val_frac: float, test_frac:
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  SINDy LIBRARY  Θ(z)
 # ─────────────────────────────────────────────────────────────────────────────
-def sindy_library(z: torch.Tensor, poly_degree: int = 2) -> torch.Tensor:
+# Why an exp library for chemistry:
+#   In log-space (u = ln state), every elementary mass-action reaction term has
+#   the form  exp(linear function of u) — that is the whole point of working
+#   in log space. After encoding to z, the latent dynamics inherit the same
+#   structure: ż_k = Σ_r c_{k,r} · exp(α_r · z + β_r). A polynomial library in
+#   z cannot represent exp/Arrhenius nonlinearity; an exp library can.
+def sindy_library(z: torch.Tensor, lib_type: str = 'mixed',
+                  poly_degree: int = 2) -> torch.Tensor:
     """
-    Build polynomial library Θ(z) for each sample.
+    Build the SINDy library Θ(z) for each sample.
     z: [batch, latent_dim]
     Returns Θ: [batch, n_library_terms]
 
-    Terms: [1, z1, z2, ..., z1², z1z2, z2², ...]
+    lib_type:
+      'poly'  — Champion 2019 polynomial library
+                  [1, z_i, z_i*z_j (i≤j)]
+      'exp'   — exponential library (chemistry-friendly)
+                  [1, z_i, exp(z_i), exp(-z_i)]
+      'mixed' — poly ∪ exp (default)
+                  [1, z_i, z_i*z_j (i≤j), exp(z_i), exp(-z_i)]
+
+    Notes
+    -----
+    The encoder uses tanh on its output, so z ∈ [-1, 1]^d. Then exp(z_i) ∈
+    [1/e, e] ≈ [0.37, 2.72] — bounded, no numerical blowup.
     """
-    batch = z.shape[0]
-    terms = [torch.ones(batch, 1, device=z.device)]  # constant term
+    batch, latent_dim = z.shape
+    terms = [torch.ones(batch, 1, device=z.device)]   # constant
+    terms.append(z)                                   # linear z_i
 
-    # Degree 1
-    terms.append(z)                                    # [batch, latent_dim]
-
-    if poly_degree >= 2:
-        # Degree 2: all unique pairs (including z_i * z_i)
-        latent_dim = z.shape[1]
+    if lib_type in ('poly', 'mixed') and poly_degree >= 2:
         for i in range(latent_dim):
             for j in range(i, latent_dim):
                 terms.append((z[:, i] * z[:, j]).unsqueeze(1))
 
-    return torch.cat(terms, dim=1)   # [batch, n_theta]
+    if lib_type in ('exp', 'mixed'):
+        terms.append(torch.exp(z))                    # exp(z_i)
+        terms.append(torch.exp(-z))                   # exp(-z_i)
+
+    return torch.cat(terms, dim=1)
 
 
-def sindy_library_size(latent_dim: int, poly_degree: int) -> int:
-    """Number of library terms for given latent_dim and poly_degree."""
-    n = 1 + latent_dim
-    if poly_degree >= 2:
-        n += latent_dim * (latent_dim + 1) // 2
+def sindy_library_size(latent_dim: int, poly_degree: int = 2,
+                       lib_type: str = 'mixed') -> int:
+    """Number of library terms (must match sindy_library output exactly)."""
+    n = 1 + latent_dim                                  # constant + linear
+    if lib_type in ('poly', 'mixed') and poly_degree >= 2:
+        n += latent_dim * (latent_dim + 1) // 2          # z_i * z_j (i ≤ j)
+    if lib_type in ('exp', 'mixed'):
+        n += 2 * latent_dim                              # exp(±z_i)
     return n
+
+
+def sindy_library_term_names(latent_dim: int, poly_degree: int = 2,
+                             lib_type: str = 'mixed') -> list:
+    """Human-readable names — order MUST mirror sindy_library()."""
+    names = ['1']
+    names += [f'z{i+1}' for i in range(latent_dim)]
+    if lib_type in ('poly', 'mixed') and poly_degree >= 2:
+        for i in range(latent_dim):
+            for j in range(i, latent_dim):
+                names.append(f'z{i+1}²' if i == j else f'z{i+1}z{j+1}')
+    if lib_type in ('exp', 'mixed'):
+        names += [f'exp(z{i+1})'  for i in range(latent_dim)]
+        names += [f'exp(-z{i+1})' for i in range(latent_dim)]
+    return names
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -255,11 +348,13 @@ class SINDyAutoencoder(nn.Module):
                   ż = Θ(z) Ξ   (sparse dynamics in latent space)
     """
     def __init__(self, n_x: int, latent_dim: int,
-                 enc_hidden: list, dec_hidden: list, poly_degree: int = 2):
+                 enc_hidden: list, dec_hidden: list, poly_degree: int = 2,
+                 lib_type: str = 'mixed'):
         super().__init__()
         self.latent_dim  = latent_dim
         self.poly_degree = poly_degree
-        n_theta = sindy_library_size(latent_dim, poly_degree)
+        self.lib_type    = lib_type
+        n_theta = sindy_library_size(latent_dim, poly_degree, lib_type)
 
         # φ: encoder
         enc_dims = [n_x] + enc_hidden + [latent_dim]
@@ -285,7 +380,7 @@ class SINDyAutoencoder(nn.Module):
 
     def sindy_predict_zdot(self, z):
         """ż = Θ(z) Ξ"""
-        theta = sindy_library(z, self.poly_degree)  # [batch, n_theta]
+        theta = sindy_library(z, self.lib_type, self.poly_degree)  # [batch, n_theta]
         return theta @ self.Xi                       # [batch, latent_dim]
 
     def forward(self, x):
@@ -522,7 +617,8 @@ def train(cfg: dict = CFG):
 
     # ── Load data ─────────────────────────────────────────────────────────────
     (train_loader, val_loader, test_loader), stats, raw = load_and_normalize(
-        cfg['csv_path'], cfg['species'], cfg['val_frac'], cfg['test_frac']
+        cfg['csv_path'], cfg['species'], cfg['val_frac'], cfg['test_frac'],
+        use_ln_state=cfg.get('use_ln_state', True),
     )
 
     # ── Build model ───────────────────────────────────────────────────────────
@@ -532,11 +628,14 @@ def train(cfg: dict = CFG):
         enc_hidden = cfg['enc_hidden'],
         dec_hidden = cfg['dec_hidden'],
         poly_degree= cfg['sindy_poly_degree'],
+        lib_type   = cfg.get('sindy_lib_type', 'mixed'),
     ).to(DEVICE)
 
-    n_theta = sindy_library_size(cfg['latent_dim'], cfg['sindy_poly_degree'])
+    n_theta = sindy_library_size(cfg['latent_dim'], cfg['sindy_poly_degree'],
+                                 cfg.get('sindy_lib_type', 'mixed'))
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel: n_x={n_x}  latent_dim={cfg['latent_dim']}  "
+          f"lib={cfg.get('sindy_lib_type','mixed')}  "
           f"n_theta={n_theta}  params={total_params:,}")
 
     # ── Optimizer: AdamW + CosineAnnealingWarmRestarts  ──────────────────────
@@ -645,7 +744,8 @@ def train(cfg: dict = CFG):
     print(f"Test MSE (reconstruction, normalised log10 space): {test_mse/n_test:.6f}")
 
     # ── Print discovered Ξ  ───────────────────────────────────────────────────
-    print_sindy_coefficients(model, cfg['latent_dim'], cfg['sindy_poly_degree'])
+    print_sindy_coefficients(model, cfg['latent_dim'], cfg['sindy_poly_degree'],
+                             cfg.get('sindy_lib_type', 'mixed'))
 
     return model, history, stats
 
@@ -653,23 +753,15 @@ def train(cfg: dict = CFG):
 # ─────────────────────────────────────────────────────────────────────────────
 # 10.  PRINT SINDY DISCOVERED EQUATIONS
 # ─────────────────────────────────────────────────────────────────────────────
-def print_sindy_coefficients(model: SINDyAutoencoder, latent_dim: int, poly_degree: int):
+def print_sindy_coefficients(model: SINDyAutoencoder, latent_dim: int,
+                             poly_degree: int, lib_type: str = 'mixed'):
     """Print the discovered sparse dynamics ż = Θ(z) Ξ in human-readable form."""
     Xi = model.Xi.detach().cpu().numpy()
+    terms = sindy_library_term_names(latent_dim, poly_degree, lib_type)
+    assert Xi.shape[0] == len(terms), \
+        f"Ξ has {Xi.shape[0]} rows, term list has {len(terms)} — library mismatch!"
 
-    # Build library term names
-    terms = ['1']
-    for i in range(latent_dim):
-        terms.append(f'z{i+1}')
-    if poly_degree >= 2:
-        for i in range(latent_dim):
-            for j in range(i, latent_dim):
-                if i == j:
-                    terms.append(f'z{i+1}²')
-                else:
-                    terms.append(f'z{i+1}z{j+1}')
-
-    print("\n── Discovered SINDy Equations ż = Θ(z)Ξ ──")
+    print(f"\n── Discovered SINDy Equations ż = Θ(z)Ξ  (lib='{lib_type}') ──")
     for k in range(latent_dim):
         nonzero = [(terms[t], Xi[t, k]) for t in range(len(terms)) if abs(Xi[t, k]) > 1e-6]
         if nonzero:
@@ -779,49 +871,61 @@ def plot_reconstruction(
     species: list,
     device: str = 'cpu',
     save_path: str = 'sindy_reconstruction.png',
+    plot_ics: list = None,
 ):
-    """Plot ground truth vs SINDy-Autoencoder reconstruction."""
+    """Ground truth vs SINDy-AE reconstruction, multi-IC aware, ln/log10 aware."""
     df = pd.read_csv(csv_path)
-    n_species = len(species)
+    use_ln = stats.get('use_ln_state', False)
+    LN10   = float(np.log(10.0))
 
-    # Build normalised Y (same as training)
     log10_sp = np.stack([df[f'log10_X_{s}'].values for s in species], axis=1)
     log10_T  = np.log10(df['T_K'].values).reshape(-1, 1)
     log10_P  = np.log10(df['P_Pa'].values).reshape(-1, 1)
-    Y_raw    = np.hstack([log10_sp, log10_T, log10_P]).astype(np.float32)
+    Y_log10  = np.hstack([log10_sp, log10_T, log10_P]).astype(np.float32)
+    Y_raw    = (Y_log10 * LN10) if use_ln else Y_log10
     Y_norm   = (Y_raw - stats['Y_mean']) / (stats['Y_std'] + 1e-8)
-
-    Y_t = torch.tensor(Y_norm).to(device)
 
     model.eval()
     with torch.no_grad():
-        z, Y_hat_norm = model(Y_t)
+        _, Y_hat_norm = model(torch.tensor(Y_norm).to(device))
         Y_hat_norm = Y_hat_norm.cpu().numpy()
 
-    # De-normalise
-    Y_hat_log10 = Y_hat_norm * (stats['Y_std'] + 1e-8) + stats['Y_mean']
-    Y_hat_orig  = 10.0 ** Y_hat_log10
-    Y_orig      = 10.0 ** Y_raw
+    Y_hat_log = Y_hat_norm * (stats['Y_std'] + 1e-8) + stats['Y_mean']
+    Y_hat_orig = np.exp(Y_hat_log) if use_ln else 10.0 ** Y_hat_log
+    Y_orig     = np.exp(Y_raw)     if use_ln else 10.0 ** Y_raw
 
-    time = df['time'].values
+    has_ic = 'IC_index' in df.columns
+    if has_ic and plot_ics is None:
+        plot_ics = sorted(df['IC_index'].unique().tolist())[:3]
+    elif not has_ic:
+        plot_ics = [None]
 
-    fig, axes = plt.subplots(3, 3, figsize=(15, 10))
-    axes = axes.flatten()
     plot_species = species[:8] + ['T']
     orig_cols    = [f'X_{s}' for s in species] + ['T', 'P']
 
-    for idx, (sp, ax) in enumerate(zip(plot_species, axes)):
-        col_idx = orig_cols.index(f'X_{sp}') if sp in species else orig_cols.index('T')
-        ax.semilogx(time, Y_orig[:, col_idx],      'k-',  lw=2, label='Cantera (truth)')
-        ax.semilogx(time, Y_hat_orig[:, col_idx],  'r--', lw=1.5, label='SINDy-AE')
-        ax.set_title(sp); ax.set_xlabel('Time (s)')
-        ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+    for ic in plot_ics:
+        if ic is None:
+            mask = np.ones(len(df), dtype=bool); tag = ''
+            suptitle = 'SINDy-AE (exp library) Reconstruction vs Cantera'
+        else:
+            mask = (df['IC_index'].values == ic); tag = f'_IC{int(ic):02d}'
+            suptitle = f'SINDy-AE (exp library) — IC {int(ic)}'
 
-    plt.suptitle('SINDy-Autoencoder Reconstruction vs Cantera', fontsize=13)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    print(f"Saved reconstruction plot → {save_path}")
-    plt.show()
+        time = df['time'].values[mask]
+        Y_o, Y_h = Y_orig[mask], Y_hat_orig[mask]
+
+        fig, axes = plt.subplots(3, 3, figsize=(15, 10)); axes = axes.flatten()
+        for sp, ax in zip(plot_species, axes):
+            col = orig_cols.index(f'X_{sp}') if sp in species else orig_cols.index('T')
+            ax.semilogx(time, Y_o[:, col], 'k-',  lw=2,   label='Cantera')
+            ax.semilogx(time, Y_h[:, col], 'r--', lw=1.5, label='SINDy-AE')
+            ax.set_title(sp); ax.set_xlabel('Time (s)')
+            ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+        plt.suptitle(suptitle, fontsize=13); plt.tight_layout()
+        out = save_path.replace('.png', f'{tag}.png')
+        plt.savefig(out, dpi=150); plt.close(fig)
+        print(f"Saved reconstruction plot → {out}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -863,14 +967,18 @@ def save_predictions_csv(
     log10_t   = df_ref['log10_t'].values        # [N]  log10(time)
 
     # ── Build normalised Y for encoder input (same as training) ──────────────
+    use_ln = stats.get('use_ln_state', False)
+    LN10   = float(np.log(10.0))
+
     log10_sp = np.stack(
         [df_ref[f'log10_X_{s}'].values for s in species], axis=1
     ).astype(np.float32)                                           # [N, n_sp]
     log10_T  = np.log10(df_ref['T_K'].values).reshape(-1, 1).astype(np.float32)
     log10_P  = np.log10(df_ref['P_Pa'].values).reshape(-1, 1).astype(np.float32)
 
-    Y_raw  = np.hstack([log10_sp, log10_T, log10_P])              # [N, n_sp+2]
-    Y_norm = (Y_raw - stats['Y_mean']) / (stats['Y_std'] + 1e-8)  # normalised
+    Y_log10 = np.hstack([log10_sp, log10_T, log10_P])              # [N, n_sp+2]
+    Y_raw   = (Y_log10 * LN10) if use_ln else Y_log10
+    Y_norm  = (Y_raw - stats['Y_mean']) / (stats['Y_std'] + 1e-8)
 
     # ── Run encoder → decoder in batches (avoids OOM on large datasets) ───────
     BATCH = 2048
@@ -885,10 +993,9 @@ def save_predictions_csv(
 
     Y_hat_norm = np.vstack(Y_hat_norm_list)            # [N, n_sp+2]
 
-    # ── De-normalise: y_log10 = y_norm*(Y_std+ε) + Y_mean  then 10^(·) ───────
-    # (exactly the same two lines as predict_batch in data_machine_learning.py)
-    Y_hat_log10 = Y_hat_norm * (stats['Y_std'] + 1e-8) + stats['Y_mean']
-    Y_hat_orig  = 10.0 ** Y_hat_log10                 # [N, n_sp+2]
+    # ── De-normalise back to log-of-state, then exponentiate ─────────────────
+    Y_hat_log = Y_hat_norm * (stats['Y_std'] + 1e-8) + stats['Y_mean']
+    Y_hat_orig = np.exp(Y_hat_log) if use_ln else 10.0 ** Y_hat_log   # [N, n_sp+2]
 
     # ── Unpack columns ────────────────────────────────────────────────────────
     X_pred   = Y_hat_orig[:, :n_species]               # mole fractions  [N, n_sp]
@@ -914,6 +1021,11 @@ def save_predictions_csv(
     data['T_K']       = T_pred
     data['P_Pa']      = P_pred
     data['rho_kgm3']  = np.full(len(time), np.nan)    # not predicted by AE
+
+    # Preserve IC_index + IC0_<species> columns if present
+    for col in df_ref.columns:
+        if col == 'IC_index' or col.startswith('IC0_'):
+            data[col] = df_ref[col].values
 
     df_out = pd.DataFrame(data)
 
@@ -980,10 +1092,12 @@ if __name__ == '__main__':
             enc_hidden = cfg_['enc_hidden'],
             dec_hidden = cfg_['dec_hidden'],
             poly_degree= cfg_['sindy_poly_degree'],
+            lib_type   = cfg_.get('sindy_lib_type', 'mixed'),
         ).to(DEVICE)
         model_.load_state_dict(ckpt['model_state_dict'])
 
-        print_sindy_coefficients(model_, cfg_['latent_dim'], cfg_['sindy_poly_degree'])
+        print_sindy_coefficients(model_, cfg_['latent_dim'], cfg_['sindy_poly_degree'],
+                                 cfg_.get('sindy_lib_type', 'mixed'))
         plot_reconstruction(model_, CFG['csv_path'], stats_, species_, device=DEVICE)
 
         # ── Save predictions CSV (format = training_data.csv) ─────────────────
